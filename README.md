@@ -1,9 +1,18 @@
-# Virtual Nail Try-On (POC)
+# Virtual Nail Try-On
 
-پروژه تست مجازی لاک ناخن بر پایه بینایی ماشین و یادگیری عمیق.
+A realistic computer vision and image processing pipeline for virtual nail polish and nail art pattern try-on using MediaPipe and OpenCV.
 
-## نحوه اجرا در ویندوز:
+## Features
 
-```cmd
-python main.py --image assets\sample_hand.jpg --color "#E91E63" --output outputs\result.jpg
+- **Accurate Landmark Detection**: Uses MediaPipe to locate fingertips and nail plates.
+- **Adaptive Segmentation**: Color-space differential analysis and corridor masking for precise nail boundaries.
+- **Perspective & 3D Warping**: Non-linear cylindrical roll-off simulation and homography mapping for nail art textures.
+- **Photorealistic Blending**: Preserves natural specular highlights and ambient luminance.
+
+## Installation
+
+```bash
+git clone https://github.com/USERNAME/virtual-nail-tryon.git
+cd virtual-nail-tryon
+pip install -r requirements.txt
 ```
