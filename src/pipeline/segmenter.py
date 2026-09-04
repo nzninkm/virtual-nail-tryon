@@ -8,13 +8,14 @@ class NailSegmenter:
 
     def segment_nail(self, roi_bgr: np.ndarray, tip_pt: Tuple[int, int], dip_pt: Tuple[int, int]) -> np.ndarray:
         """
-        Extract precise nail contour using adaptive GrabCut segmentation guided by finger orientation.
+        Segment the exact natural nail boundaries using skin-differential color analysis
+        and directional gradient edge clamping.
         """
         h, w = roi_bgr.shape[:2]
-        if h == 0 or w == 0:
+        if h < 10 or w < 10:
             return np.zeros((h, w), dtype=np.uint8)
 
-        # 1. Compute finger orientation vector
+        # 1. Compute directional axis of finger bone
         dx = float(tip_pt[0] - dip_pt[0])
         dy = float(tip_pt[1] - dip_pt[1])
         dist = np.hypot(dx, dy)
@@ -24,77 +25,193 @@ class NailSegmenter:
         else:
             unit_dx, unit_dy = dx / dist, dy / dist
 
-        # 2. Offset nail bed center from the flesh fingertip towards the cuticle
-        nail_offset = dist * 0.28
+        # Perpendicular normal vector
+        perp_dx, perp_dy = -unit_dy, unit_dx
+
+        # 2. Estimate biological nail center and dynamic bounding dimensions
+        nail_offset = dist * 0.30
         nail_cx = tip_pt[0] - unit_dx * nail_offset
         nail_cy = tip_pt[1] - unit_dy * nail_offset
 
-        # 3. Calculate dynamic nail dimensions based on distance
-        nail_length = max(int(dist * 0.72), 12)
-        nail_width = max(int(dist * 0.48), 10)
-        angle_deg = np.degrees(np.arctan2(unit_dy, unit_dx))
+        half_len = dist * 0.42
+        half_width = dist * 0.28
 
-        # 4. Initialize GrabCut mask
-        # cv2.GC_BGD = 0, cv2.GC_FGD = 1, cv2.GC_PR_BGD = 2, cv2.GC_PR_FGD = 3
-        gc_mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
+        # 3. Create a directional search corridor along finger axis
+        corridor_mask = np.zeros((h, w), dtype=np.uint8)
+        c_p1 = (int(nail_cx - unit_dx * half_len - perp_dx * half_width), int(nail_cy - unit_dy * half_len - perp_dy * half_width))
+        c_p2 = (int(nail_cx + unit_dx * half_len - perp_dx * half_width), int(nail_cy + unit_dy * half_len - perp_dy * half_width))
+        c_p3 = (int(nail_cx + unit_dx * half_len + perp_dx * half_width), int(nail_cy + unit_dy * half_len + perp_dy * half_width))
+        c_p4 = (int(nail_cx - unit_dx * half_len + perp_dx * half_width), int(nail_cy - unit_dy * half_len + perp_dy * half_width))
+        cv2.fillConvexPoly(corridor_mask, np.array([c_p1, c_p2, c_p3, c_p4], dtype=np.int32), 255)
 
-        # Probable foreground: oriented bounding box around nail bed
-        rect = ((nail_cx, nail_cy), (nail_length * 1.15, nail_width * 1.15), angle_deg)
-        box = cv2.boxPoints(rect)
-        box = np.intp(box)
-        cv2.fillPoly(gc_mask, [box], cv2.GC_PR_FGD)
+        # 4. Multi-color space nail tissue extraction
+        # YCrCb: Cr channel separates skin pigments; Lab: B channel highlights keratin differences
+        ycrcb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb)
+        lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
 
-        # Definite foreground: compact core of the nail plate
-        core_rect = ((nail_cx, nail_cy), (nail_length * 0.55, nail_width * 0.55), angle_deg)
-        core_box = cv2.boxPoints(core_rect)
-        core_box = np.intp(core_box)
-        cv2.fillPoly(gc_mask, [core_box], cv2.GC_FGD)
+        cr = ycrcb[:, :, 1]
+        b_channel = lab[:, :, 2]
+        l_channel = lab[:, :, 0]
 
-        # 5. Run GrabCut optimization
-        bgd_model = np.zeros((1, 65), np.float64)
-        fgd_model = np.zeros((1, 65), np.float64)
+        # Enhance contrast using CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(6, 6))
+        enhanced_l = clahe.apply(l_channel)
 
-        try:
-            cv2.grabCut(
-                roi_bgr,
-                gc_mask,
-                None,
-                bgd_model,
-                fgd_model,
-                iterCount=3,
-                mode=cv2.GC_INIT_WITH_MASK
-            )
-            final_mask = np.where((gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
-        except Exception:
-            # Fallback to oriented geometric box if GrabCut encounters degenerate bounds
-            final_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillPoly(final_mask, [box], 255)
+        # 5. Differential map inside corridor
+        diff_score = (cr.astype(np.float32) * 0.4) + (enhanced_l.astype(np.float32) * 0.6) - (b_channel.astype(np.float32) * 0.3)
+        diff_score = np.clip(diff_score, 0, 255).astype(np.uint8)
 
-        # 6. Morphological refinement to eliminate stray edge noise
+        # Directional gradient thresholding
+        masked_diff = cv2.bitwise_and(diff_score, diff_score, mask=corridor_mask)
+        valid_pixels = masked_diff[corridor_mask > 0]
+
+        if valid_pixels.size == 0:
+            return np.zeros((h, w), dtype=np.uint8)
+
+        mean_val = np.mean(valid_pixels)
+        std_val = np.std(valid_pixels)
+        thresh_val = mean_val - 0.25 * std_val
+
+        _, binary = cv2.threshold(masked_diff, thresh_val, 255, cv2.THRESH_BINARY)
+
+        # 6. Directional morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        clean_mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        # 7. Extract the primary connected component closest to nail center
-        contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 7. Select the optimal contour nearest to the biological nail center
+        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        best_mask = np.zeros((h, w), dtype=np.uint8)
+
         if contours:
-            best_cnt = None
-            min_dist = float("inf")
+            candidates = []
             for cnt in contours:
-                if cv2.contourArea(cnt) < 25:
+                area = cv2.contourArea(cnt)
+                if area < 30:
                     continue
                 m = cv2.moments(cnt)
                 if m["m00"] > 0:
                     cx = m["m10"] / m["m00"]
                     cy = m["m01"] / m["m00"]
                     d = np.hypot(cx - nail_cx, cy - nail_cy)
-                    if d < min_dist:
-                        min_dist = d
-                        best_cnt = cnt
+                    candidates.append((cnt, d, area))
 
-            if best_cnt is not None:
-                isolated_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.drawContours(isolated_mask, [best_cnt], -1, 255, -1)
-                final_mask = isolated_mask
+            if candidates:
+                # Rank by distance to calculated nail center and sensible area
+                candidates.sort(key=lambda item: item[1] / np.sqrt(item[2]))
+, 3))
+        clean_mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        return final_mask
+        # 7. Select the optimal contour nearest to the biological nail center
+        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        best_mask = np.zeros((h, w), dtype=np.uint8)
+
+        if contours:
+            candidates = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < 30:
+                    continue
+                m = cv2.moments(cnt)
+                if m["m00"] > 0:
+                    cx = m["m10"] / m["m00"]
+                    cy = m["m01"] / m["m00"]
+                    d = np.hypot(cx - nail_cx, cy - nail_cy)
+                    candidates.append((cnt, d, area))
+
+            if candidates:
+                # Rank by distance to calculated nail center and sensible area
+                candidates.sort(key=lambda item: item[1] / np.sqrt(item[2]))
+                best_cnt = candidates[0][0]
+                hull = cv2.convexHull(best_cnt)
+                cv2.drawContours(best_mask, [hull], -1, 255, -1)
+            else:
+                cv2.fillConvexPoly(best_mask, np.array([c_p1, c_p2, c_p3, c_p4], dtype=np.int32), 255)
+        else:
+            cv2.fillConvexPoly(best_mask, np.array([c_p1, c_p2, c_p3, c_p4], dtype=np.int3argument("--color", type=str, default=None, help="Target nail polish hex color (e.g. #E91E63)")
+    parser.add_argument("--pattern", type=str, default=None, help="Nail art pattern texture path")
+    parser.add_argument("--output", type=str, default="outputs/result.jpg", help="Output result image path")
+    parser.add_argument("--model", type=str, default="hand_landmarker.task", help="Path to MediaPipe landmarker task model")
+    parser.add_argument("--debug", action="store_true", help="Save intermediate segmentation mask overlays for inspection")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.image):
+        print(f"Error: Input image {args.image} not found.")
+        return
+
+    if not args.color and not args.pattern:
+        args.color = "#E91E63"
+
+    pattern_img = None
+    if args.pattern:
+        if not os.path.exists(args.pattern):
+            print(f"Error: Pattern texture {args.pattern} not found.")
+            return
+        pattern_img = cv2.imread(args.pattern, cv2.IMREAD_UNCHANGED)
+        pattern_img = NailWarper.apply_cylindrical_curvature(pattern_img, strength=0.35)
+
+    image_bgr = cv2.imread(args.image)
+    if image_bgr is None:
+        print("Error: Could not read image.")
+        return
+
+    detector = HandDetector(model_path=args.model)
+    segmenter = NailSegmenter()
+
+    print("Detecting fingertips and landmarks...")
+    nails = detector.detect_fingertips(image_bgr)
+    print(f"Detected {len(nails)} nail candidates.")
+
+    result = image_bgr.copy()
+    debug_img = image_bgr.copy() if args.debug else None
+
+    for nail in nails:
+        x1, y1, x2, y2 = nail["roi_box"]
+        roi = result[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+
+        tip_local = (nail["tip"][0] - x1, nail["tip"][1] - y1)
+        dip_local = (nail["dip"][0] - x1, nail["dip"][1] - y1)
+
+        # Segment nail boundary
+        mask = segmenter.segment_nail(roi, tip_local, dip_local)
+
+        if args.debug and debug_img is not None:
+            # Draw contours of segmented mask in bright green
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                offset_cnt = cnt + np.array([x1, y1])
+                cv2.drawContours(debug_img, [offset_cnt], -1, (0, 255, 0), 2)
+            cv2.circle(debug_img, nail["tip"], 4, (0, 0, 255), -1)
+            cv2.circle(debug_img, nail["dip"], 4, (255, 0, 0), -1)
+
+        if pattern_img is not None:
+            quad = NailGeometry.extract_nail_quad(mask, tip_local, dip_local)
+            if quad is not None:
+                warped = NailWarper.warp_pattern_to_quad(pattern_img, quad, roi.shape[:2])
+                roi_rendered = NailRenderer.blend_pattern(roi, mask, warped)
+            else:
+                target_bgr = (99, 30, 233)
+                roi_rendered = NailRenderer.blend_solid_color(roi, mask, target_bgr)
+        else:
+            target_bgr = NailRenderer.hex_to_bgr(args.color)
+            roi_rendered = NailRenderer.blend_solid_color(roi, mask, target_bgr)
+
+        result[y1:y2, x1:x2] = roi_rendered
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    cv2.imwrite(args.output, result)
+    print(f"Output saved to: {args.output}")
+
+    if args.debug and debug_img is not None:
+        debug_path = os.path.join(os.path.dirname(os.path.abspath(args.output)), "debug_mask.jpg")
+        cv2.imwrite(debug_path, debug_img)
+        print(f"Debug mask visualization saved to: {debug_path}")
+
+if __name__ == "__main__":
+    main()
