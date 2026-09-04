@@ -1,17 +1,26 @@
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 from typing import List, Dict, Any
 import numpy as np
+import os
 
 class HandDetector:
-    def __init__(self, max_num_hands: int = 2, min_detection_confidence: float = 0.6):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=True,
-            max_num_hands=max_num_hands,
-            min_detection_confidence=min_detection_confidence
+    def __init__(self, model_path: str = "hand_landmarker.task", max_num_hands: int = 2):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"فایل مدل {model_path} یافت نشد. لطفاً دستور دانلود مدل را اجرا کنید."
+            )
+            
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=max_num_hands,
+            min_hand_detection_confidence=0.5
         )
-        # اندیس لندمارک‌های نوک انگشتان و مفاصل قبلی آن‌ها
+        self.detector = vision.HandLandmarker.create_from_options(options)
+
         self.FINGERTIP_INDICES = {
             "THUMB": (4, 3),
             "INDEX": (8, 7),
@@ -21,24 +30,24 @@ class HandDetector:
         }
 
     def detect_fingertips(self, image_bgr: np.ndarray) -> List[Dict[str, Any]]:
-        """تشخیص نوک انگشتان و تخمین کادر برش (ROI) اطراف ناخن"""
         h, w, _ = image_bgr.shape
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(image_rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
         
+        detection_result = self.detector.detect(mp_image)
         detected_nails = []
-        if not results.multi_hand_landmarks:
+
+        if not detection_result.hand_landmarks:
             return detected_nails
 
-        for hand_landmarks in results.multi_hand_landmarks:
+        for hand_landmarks in detection_result.hand_landmarks:
             for finger_name, (tip_idx, dip_idx) in self.FINGERTIP_INDICES.items():
-                tip = hand_landmarks.landmark[tip_idx]
-                dip = hand_landmarks.landmark[dip_idx]
+                tip = hand_landmarks[tip_idx]
+                dip = hand_landmarks[dip_idx]
 
                 tip_px = (int(tip.x * w), int(tip.y * h))
                 dip_px = (int(dip.x * w), int(dip.y * h))
 
-                # تخمین اندازه ناخن بر اساس فاصله مفصل تا نوک انگشت
                 dist = np.linalg.norm(np.array(tip_px) - np.array(dip_px))
                 box_radius = max(int(dist * 0.9), 20)
 
