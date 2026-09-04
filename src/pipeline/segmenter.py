@@ -1,217 +1,221 @@
+"""Robust and universal nail segmentation module adapting to any hand pose and skin tone."""
 import cv2
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Optional
+
 
 class NailSegmenter:
+    """Universal nail segmentation combining directional ROI alignment, adaptive color analysis, and iterative GrabCut."""
+
     def __init__(self):
         pass
 
-    def segment_nail(self, roi_bgr: np.ndarray, tip_pt: Tuple[int, int], dip_pt: Tuple[int, int]) -> np.ndarray:
-        """
-        Segment the exact natural nail boundaries using skin-differential color analysis
-        and directional gradient edge clamping.
-        """
+    def _align_and_crop(
+        self,
+        roi_bgr: np.ndarray,
+        tip: np.ndarray,
+        dip: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, float, Tuple[float, float], float]:
+        """Align finger axis vertically to normalize perspective variations across different hand poses."""
+        finger_vec = tip - dip
+        finger_len = float(np.linalg.norm(finger_vec))
+
+        if finger_len < 2.0:
+            finger_vec = np.array([0.0, -1.0], dtype=np.float32)
+            finger_len = float(max(roi_bgr.shape[0], 20))
+
+        # Finger orientation angle
+        angle_rad = np.arctan2(finger_vec[1], finger_vec[0])
+        angle_deg = float(np.degrees(angle_rad))
+
+        # Rotation matrix to align finger along vertical Y axis (pointing up)
+        center = (float(tip[0]), float(tip[1]))
+        rot_angle = angle_deg + 90.0
+        rot_mat = cv2.getRotationMatrix2D(center, rot_angle, 1.0)
+
         h, w = roi_bgr.shape[:2]
-        if h < 10 or w < 10:
+        aligned = cv2.warpAffine(
+            roi_bgr,
+            rot_mat,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+
+        return aligned, rot_mat, rot_angle, center, finger_len
+
+    def segment_nail(
+        self,
+        roi_bgr: np.ndarray,
+        tip_pt: Tuple[int, int],
+        dip_pt: Tuple[int, int],
+    ) -> np.ndarray:
+        """
+        Segment fingernail boundary adaptively across diverse lighting, shapes, and angles.
+        """
+        if roi_bgr is None or roi_bgr.size == 0:
+            return np.zeros((0, 0), dtype=np.uint8)
+
+        h, w = roi_bgr.shape[:2]
+        tip = np.asarray(tip_pt, dtype=np.float32)
+        dip = np.asarray(dip_pt, dtype=np.float32)
+
+        # 1. Normalize orientation
+        aligned_bgr, rot_mat, rot_angle, center, finger_len = self._align_and_crop(
+            roi_bgr, tip, dip
+        )
+
+        # Tip position in aligned coordinate space
+        aligned_tip = np.array([center[0], center[1]], dtype=np.float32)
+
+        # 2. Define adaptive nail search bounds in aligned space
+        # Covers natural short nails to extended acrylic/fake nails
+        half_w = max(5.0, finger_len * 0.28)
+        top_offset = finger_len * 0.18    # Space beyond fingertip for long nails
+        bottom_offset = finger_len * 0.45 # Space towards DIP joint for nail base
+
+        x_min = int(np.clip(round(aligned_tip[0] - half_w), 0, w - 1))
+        x_max = int(np.clip(round(aligned_tip[0] + half_w), 0, w - 1))
+        y_min = int(np.clip(round(aligned_tip[1] - top_offset), 0, h - 1))
+        y_max = int(np.clip(round(aligned_tip[1] + bottom_offset), 0, h - 1))
+
+        if x_max <= x_min or y_max <= y_min:
             return np.zeros((h, w), dtype=np.uint8)
 
-        # 1. Compute directional axis of finger bone
-        dx = float(tip_pt[0] - dip_pt[0])
-        dy = float(tip_pt[1] - dip_pt[1])
-        dist = np.hypot(dx, dy)
+        # 3. Multi-color space & contrast extraction
+        lab = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2LAB)
+        hsv = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2GRAY)
 
-        if dist < 1e-4:
-            unit_dx, unit_dy = 0.0, -1.0
+        # Sample local skin baseline below cuticle area
+        skin_y1 = int(np.clip(round(aligned_tip[1] + finger_len * 0.40), 0, h - 1))
+        skin_y2 = int(np.clip(round(aligned_tip[1] + finger_len * 0.70), 0, h - 1))
+        skin_patch = lab[skin_y1:skin_y2, x_min:x_max]
+
+        if skin_patch.size > 0:
+            skin_mean = np.mean(skin_patch, axis=(0, 1))
+            diff_map = np.linalg.norm(lab.astype(np.float32) - skin_mean, axis=2)
         else:
-            unit_dx, unit_dy = dx / dist, dy / dist
+            diff_map = np.zeros((h, w), dtype=np.float32)
 
-        # Perpendicular normal vector
-        perp_dx, perp_dy = -unit_dy, unit_dx
+        # 4. Construct adaptive GrabCut probabilistic matrix
+        gc_mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
 
-        # 2. Estimate biological nail center and dynamic bounding dimensions
-        nail_offset = dist * 0.30
-        nail_cx = tip_pt[0] - unit_dx * nail_offset
-        nail_cy = tip_pt[1] - unit_dy * nail_offset
+        # Search window defined as probable background
+        gc_mask[y_min:y_max, x_min:x_max] = cv2.GC_PR_BGD
 
-        half_len = dist * 0.42
-        half_width = dist * 0.28
+        # Define high-confidence probable foreground based on skin differentiation & brightness
+        search_diff = diff_map[y_min:y_max, x_min:x_max]
+        if search_diff.size > 0:
+            diff_thresh = np.percentile(search_diff, 40)
+            candidate_fg = (diff_map > diff_thresh) & (gc_mask == cv2.GC_PR_BGD)
+            gc_mask[candidate_fg] = cv2.GC_PR_FGD
 
-        # 3. Create a directional search corridor along finger axis
-        corridor_mask = np.zeros((h, w), dtype=np.uint8)
-        c_p1 = (int(nail_cx - unit_dx * half_len - perp_dx * half_width), int(nail_cy - unit_dy * half_len - perp_dy * half_width))
-        c_p2 = (int(nail_cx + unit_dx * half_len - perp_dx * half_width), int(nail_cy + unit_dy * half_len - perp_dy * half_width))
-        c_p3 = (int(nail_cx + unit_dx * half_len + perp_dx * half_width), int(nail_cy + unit_dy * half_len + perp_dy * half_width))
-        c_p4 = (int(nail_cx - unit_dx * half_len + perp_dx * half_width), int(nail_cy - unit_dy * half_len + perp_dy * half_width))
-        cv2.fillConvexPoly(corridor_mask, np.array([c_p1, c_p2, c_p3, c_p4], dtype=np.int32), 255)
+        # High confidence core prior (center of the expected nail)
+        core_w = max(2.0, half_w * 0.45)
+        core_y_top = int(np.clip(round(aligned_tip[1] - finger_len * 0.05), 0, h - 1))
+        core_y_bot = int(np.clip(round(aligned_tip[1] + finger_len * 0.25), 0, h - 1))
+        core_x_l = int(np.clip(round(aligned_tip[0] - core_w), 0, w - 1))
+        core_x_r = int(np.clip(round(aligned_tip[0] + core_w), 0, w - 1))
 
-        # 4. Multi-color space nail tissue extraction
-        # YCrCb: Cr channel separates skin pigments; Lab: B channel highlights keratin differences
-        ycrcb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb)
-        lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
+        if core_x_r > core_x_l and core_y_bot > core_y_top:
+            gc_mask[core_y_top:core_y_bot, core_x_l:core_x_r] = cv2.GC_FGD
 
-        cr = ycrcb[:, :, 1]
-        b_channel = lab[:, :, 2]
-        l_channel = lab[:, :, 0]
+        # 5. Run GrabCut
+        bgd_model = np.zeros((1, 65), dtype=np.float64)
+        fgd_model = np.zeros((1, 65), dtype=np.float64)
 
-        # Enhance contrast using CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(6, 6))
-        enhanced_l = clahe.apply(l_channel)
+        try:
+            cv2.grabCut(
+                aligned_bgr,
+                gc_mask,
+                None,
+                bgd_model,
+                fgd_model,
+                iterCount=5,
+                mode=cv2.GC_INIT_WITH_MASK,
+            )
+            raw_seg = np.where(
+                (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+                255,
+                0,
+            ).astype(np.uint8)
+        except cv2.error:
+            raw_seg = np.zeros((h, w), dtype=np.uint8)
+            raw_seg[core_y_top:core_y_bot, core_x_l:core_x_r] = 255
 
-        # 5. Differential map inside corridor
-        diff_score = (cr.astype(np.float32) * 0.4) + (enhanced_l.astype(np.float32) * 0.6) - (b_channel.astype(np.float32) * 0.3)
-        diff_score = np.clip(diff_score, 0, 255).astype(np.uint8)
+        # Restrict extraction strictly within allowable bounding box
+        bounded_seg = np.zeros_like(raw_seg)
+        bounded_seg[y_min:y_max, x_min:x_max] = raw_seg[y_min:y_max, x_min:x_max]
 
-        # Directional gradient thresholding
-        masked_diff = cv2.bitwise_and(diff_score, diff_score, mask=corridor_mask)
-        valid_pixels = masked_diff[corridor_mask > 0]
+        # 6. Extract dominant continuous contour
+        contours, _ = cv2.findContours(
+            bounded_seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
 
-        if valid_pixels.size == 0:
-            return np.zeros((h, w), dtype=np.uint8)
-
-        mean_val = np.mean(valid_pixels)
-        std_val = np.std(valid_pixels)
-        thresh_val = mean_val - 0.25 * std_val
-
-        _, binary = cv2.threshold(masked_diff, thresh_val, 255, cv2.THRESH_BINARY)
-
-        # 6. Directional morphological cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        clean_mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        # 7. Select the optimal contour nearest to the biological nail center
-        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        best_mask = np.zeros((h, w), dtype=np.uint8)
-
+        aligned_mask = np.zeros((h, w), dtype=np.uint8)
         if contours:
-            candidates = []
+            # Pick contour closest to the expected nail centroid
+            target_centroid = np.array([aligned_tip[0], aligned_tip[1] + finger_len * 0.10])
+            best_cnt = None
+            min_dist = float("inf")
+
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < 30:
+                if area < (finger_len * finger_len * 0.04):
                     continue
                 m = cv2.moments(cnt)
-                if m["m00"] > 0:
-                    cx = m["m10"] / m["m00"]
-                    cy = m["m01"] / m["m00"]
-                    d = np.hypot(cx - nail_cx, cy - nail_cy)
-                    candidates.append((cnt, d, area))
-
-            if candidates:
-                # Rank by distance to calculated nail center and sensible area
-                candidates.sort(key=lambda item: item[1] / np.sqrt(item[2]))
-, 3))
-        clean_mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        # 7. Select the optimal contour nearest to the biological nail center
-        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        best_mask = np.zeros((h, w), dtype=np.uint8)
-
-        if contours:
-            candidates = []
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < 30:
+                if m["m00"] == 0:
                     continue
-                m = cv2.moments(cnt)
-                if m["m00"] > 0:
-                    cx = m["m10"] / m["m00"]
-                    cy = m["m01"] / m["m00"]
-                    d = np.hypot(cx - nail_cx, cy - nail_cy)
-                    candidates.append((cnt, d, area))
+                centroid = np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]])
+                dist = float(np.linalg.norm(centroid - target_centroid))
+                if dist < min_dist:
+                    min_dist = dist
+                    best_cnt = cnt
 
-            if candidates:
-                # Rank by distance to calculated nail center and sensible area
-                candidates.sort(key=lambda item: item[1] / np.sqrt(item[2]))
-                best_cnt = candidates[0][0]
-                hull = cv2.convexHull(best_cnt)
-                cv2.drawContours(best_mask, [hull], -1, 255, -1)
+            if best_cnt is not None:
+                cv2.drawContours(aligned_mask, [best_cnt], -1, 255, thickness=cv2.FILLED)
             else:
-                cv2.fillConvexPoly(best_mask, np.array([c_p1, c_p2, c_p3, c_p4], dtype=np.int32), 255)
+                # Fallback to morphological ellipse
+                cv2.ellipse(
+                    aligned_mask,
+                    (int(round(target_centroid[0])), int(round(target_centroid[1]))),
+                    (int(round(half_w * 0.75)), int(round(finger_len * 0.22))),
+                    0,
+                    0,
+                    360,
+                    255,
+                    -1,
+                )
         else:
-            cv2.fillConvexPoly(best_mask, np.array([c_p1, c_p2, c_p3, c_p4], dtype=np.int3argument("--color", type=str, default=None, help="Target nail polish hex color (e.g. #E91E63)")
-    parser.add_argument("--pattern", type=str, default=None, help="Nail art pattern texture path")
-    parser.add_argument("--output", type=str, default="outputs/result.jpg", help="Output result image path")
-    parser.add_argument("--model", type=str, default="hand_landmarker.task", help="Path to MediaPipe landmarker task model")
-    parser.add_argument("--debug", action="store_true", help="Save intermediate segmentation mask overlays for inspection")
-    return parser.parse_args()
+            # Fallback ellipse
+            cv2.ellipse(
+                aligned_mask,
+                (int(round(aligned_tip[0])), int(round(aligned_tip[1] + finger_len * 0.10))),
+                (int(round(half_w * 0.75)), int(round(finger_len * 0.22))),
+                0,
+                0,
+                360,
+                255,
+                -1,
+            )
 
-def main():
-    args = parse_args()
+        # 7. Rotate mask back to original coordinate system
+        inv_rot_mat = cv2.getRotationMatrix2D(center, -rot_angle, 1.0)
+        final_mask = cv2.warpAffine(
+            aligned_mask,
+            inv_rot_mat,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
 
-    if not os.path.exists(args.image):
-        print(f"Error: Input image {args.image} not found.")
-        return
+        # 8. Boundary smoothing and edge cleanup
+        k_size = max(3, int(round(finger_len * 0.04)) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
+        final_mask = cv2.GaussianBlur(final_mask, (5, 5), 1.2)
+        _, final_mask = cv2.threshold(final_mask, 127, 255, cv2.THRESH_BINARY)
 
-    if not args.color and not args.pattern:
-        args.color = "#E91E63"
-
-    pattern_img = None
-    if args.pattern:
-        if not os.path.exists(args.pattern):
-            print(f"Error: Pattern texture {args.pattern} not found.")
-            return
-        pattern_img = cv2.imread(args.pattern, cv2.IMREAD_UNCHANGED)
-        pattern_img = NailWarper.apply_cylindrical_curvature(pattern_img, strength=0.35)
-
-    image_bgr = cv2.imread(args.image)
-    if image_bgr is None:
-        print("Error: Could not read image.")
-        return
-
-    detector = HandDetector(model_path=args.model)
-    segmenter = NailSegmenter()
-
-    print("Detecting fingertips and landmarks...")
-    nails = detector.detect_fingertips(image_bgr)
-    print(f"Detected {len(nails)} nail candidates.")
-
-    result = image_bgr.copy()
-    debug_img = image_bgr.copy() if args.debug else None
-
-    for nail in nails:
-        x1, y1, x2, y2 = nail["roi_box"]
-        roi = result[y1:y2, x1:x2]
-        if roi.size == 0:
-            continue
-
-        tip_local = (nail["tip"][0] - x1, nail["tip"][1] - y1)
-        dip_local = (nail["dip"][0] - x1, nail["dip"][1] - y1)
-
-        # Segment nail boundary
-        mask = segmenter.segment_nail(roi, tip_local, dip_local)
-
-        if args.debug and debug_img is not None:
-            # Draw contours of segmented mask in bright green
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                offset_cnt = cnt + np.array([x1, y1])
-                cv2.drawContours(debug_img, [offset_cnt], -1, (0, 255, 0), 2)
-            cv2.circle(debug_img, nail["tip"], 4, (0, 0, 255), -1)
-            cv2.circle(debug_img, nail["dip"], 4, (255, 0, 0), -1)
-
-        if pattern_img is not None:
-            quad = NailGeometry.extract_nail_quad(mask, tip_local, dip_local)
-            if quad is not None:
-                warped = NailWarper.warp_pattern_to_quad(pattern_img, quad, roi.shape[:2])
-                roi_rendered = NailRenderer.blend_pattern(roi, mask, warped)
-            else:
-                target_bgr = (99, 30, 233)
-                roi_rendered = NailRenderer.blend_solid_color(roi, mask, target_bgr)
-        else:
-            target_bgr = NailRenderer.hex_to_bgr(args.color)
-            roi_rendered = NailRenderer.blend_solid_color(roi, mask, target_bgr)
-
-        result[y1:y2, x1:x2] = roi_rendered
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    cv2.imwrite(args.output, result)
-    print(f"Output saved to: {args.output}")
-
-    if args.debug and debug_img is not None:
-        debug_path = os.path.join(os.path.dirname(os.path.abspath(args.output)), "debug_mask.jpg")
-        cv2.imwrite(debug_path, debug_img)
-        print(f"Debug mask visualization saved to: {debug_path}")
-
-if __name__ == "__main__":
-    main()
+        return final_mask
