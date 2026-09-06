@@ -1,8 +1,16 @@
-"""Hand landmark detection and fingertip region-of-interest extraction using MediaPipe."""
+"""Hand landmark detection and fingertip region-of-interest extraction with robust MediaPipe imports."""
 import cv2
-import mediapipe as mp
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
+
+try:
+    import mediapipe.python.solutions.hands as mp_hands
+except ImportError:
+    try:
+        import mediapipe.solutions.hands as mp_hands
+    except ImportError:
+        import mediapipe as mp
+        mp_hands = mp.solutions.hands
 
 
 class HandDetector:
@@ -14,8 +22,7 @@ class HandDetector:
         max_num_hands: int = 2,
         min_detection_confidence: float = 0.5,
     ):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
+        self.hands = mp_hands.Hands(
             static_image_mode=static_image_mode,
             max_num_hands=max_num_hands,
             min_detection_confidence=min_detection_confidence,
@@ -44,9 +51,7 @@ class HandDetector:
         image_bgr: np.ndarray,
         multi_landmarks: Optional[List[Any]],
     ) -> List[Dict[str, Any]]:
-        """
-        Extract bounding boxes and local pixel coordinates for all detected fingertips.
-        """
+        """Extract bounding boxes and local pixel coordinates for all detected fingertips."""
         if not multi_landmarks:
             return []
 
