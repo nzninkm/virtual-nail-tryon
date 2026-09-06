@@ -1,65 +1,93 @@
+"""Hand landmark detection and fingertip region-of-interest extraction using MediaPipe."""
 import cv2
 import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from typing import List, Dict, Any
 import numpy as np
-import os
+from typing import List, Dict, Any, Optional, Tuple
+
 
 class HandDetector:
-    def __init__(self, model_path: str = "hand_landmarker.task", max_num_hands: int = 2):
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"فایل مدل {model_path} یافت نشد. لطفاً دستور دانلود مدل را اجرا کنید."
-            )
-            
-        base_options = python.BaseOptions(model_asset_path=model_path)
-        options = vision.HandLandmarkerOptions(
-            base_options=base_options,
-            num_hands=max_num_hands,
-            min_hand_detection_confidence=0.5
+    """Detects hand landmarks and isolates fingertip regions for nail processing."""
+
+    def __init__(
+        self,
+        static_image_mode: bool = True,
+        max_num_hands: int = 2,
+        min_detection_confidence: float = 0.5,
+    ):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=static_image_mode,
+            max_num_hands=max_num_hands,
+            min_detection_confidence=min_detection_confidence,
         )
-        self.detector = vision.HandLandmarker.create_from_options(options)
 
-        self.FINGERTIP_INDICES = {
-            "THUMB": (4, 3),
-            "INDEX": (8, 7),
-            "MIDDLE": (12, 11),
-            "RING": (16, 15),
-            "PINKY": (20, 19)
-        }
+        # Indices for 5 fingertips and their preceding DIP joints
+        # Format: (Tip landmark index, DIP landmark index)
+        self.finger_indices = [
+            (4, 3),    # Thumb
+            (8, 7),    # Index
+            (12, 11),  # Middle
+            (16, 15),  # Ring
+            (20, 19),  # Pinky
+        ]
 
-    def detect_fingertips(self, image_bgr: np.ndarray) -> List[Dict[str, Any]]:
-        h, w, _ = image_bgr.shape
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
-        
-        detection_result = self.detector.detect(mp_image)
-        detected_nails = []
+    def detect(self, image_bgr: np.ndarray):
+        """Process BGR image and return raw hand detection landmarks."""
+        rgb_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(rgb_image)
+        if results.multi_hand_landmarks:
+            return results.multi_hand_landmarks
+        return None
 
-        if not detection_result.hand_landmarks:
-            return detected_nails
+    def get_fingertip_rois(
+        self,
+        image_bgr: np.ndarray,
+        multi_landmarks: Optional[List[Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract bounding boxes and local pixel coordinates for all detected fingertips.
+        """
+        if not multi_landmarks:
+            return []
 
-        for hand_landmarks in detection_result.hand_landmarks:
-            for finger_name, (tip_idx, dip_idx) in self.FINGERTIP_INDICES.items():
-                tip = hand_landmarks[tip_idx]
-                dip = hand_landmarks[dip_idx]
+        h, w = image_bgr.shape[:2]
+        rois = []
 
-                tip_px = (int(tip.x * w), int(tip.y * h))
-                dip_px = (int(dip.x * w), int(dip.y * h))
+        for hand_landmarks in multi_landmarks:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks.landmark]
 
-                dist = np.linalg.norm(np.array(tip_px) - np.array(dip_px))
-                box_radius = max(int(dist * 0.9), 20)
+            for tip_idx, dip_idx in self.finger_indices:
+                tip_pt = pts[tip_idx]
+                dip_pt = pts[dip_idx]
 
-                x1 = max(0, tip_px[0] - box_radius)
-                y1 = max(0, tip_px[1] - box_radius)
-                x2 = min(w, tip_px[0] + box_radius)
-                y2 = min(h, tip_px[1] + box_radius)
+                # Estimate fingertip size from distance between DIP and TIP
+                seg_length = np.hypot(tip_pt[0] - dip_pt[0], tip_pt[1] - dip_pt[1])
+                roi_radius = int(max(20, seg_length * 1.25))
 
-                detected_nails.append({
-                    "finger": finger_name,
-                    "tip": tip_px,
-                    "dip": dip_px,
-                    "roi_box": (x1, y1, x2, y2)
+                # Compute ROI bounding box
+                center_x = tip_pt[0]
+                center_y = tip_pt[1]
+
+                x1 = max(0, center_x - roi_radius)
+                y1 = max(0, center_y - roi_radius)
+                x2 = min(w, center_x + roi_radius)
+                y2 = min(h, center_y + roi_radius)
+
+                roi_crop = image_bgr[y1:y2, x1:x2]
+                if roi_crop.size == 0:
+                    continue
+
+                # Local coordinates relative to the cropped ROI
+                tip_local = (tip_pt[0] - x1, tip_pt[1] - y1)
+                dip_local = (dip_pt[0] - x1, dip_pt[1] - y1)
+
+                rois.append({
+                    "roi": roi_crop,
+                    "bbox": (x1, y1, x2 - x1, y2 - y1),
+                    "tip_local": tip_local,
+                    "dip_local": dip_local,
+                    "tip_global": tip_pt,
+                    "dip_global": dip_pt,
                 })
-        return detected_nails
+
+        return rois
