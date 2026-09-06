@@ -16,6 +16,7 @@ from src.pipeline.geometry import NailGeometry
 from src.pipeline.warper import NailWarper
 from src.pipeline.renderer import NailRenderer
 
+segmenter = NailSegmenter(ai_model_path=args.ai_model)
 
 def parse_args():
     """Parse CLI input arguments."""
@@ -51,6 +52,13 @@ def parse_args():
         action="store_true",
         help="Save debug mask and quad boundaries to outputs/debug_mask.jpg",
     )
+        parser.add_argument(
+        "--ai-model",
+        type=str,
+        default=None,
+        help="Optional path to custom deep-learning nail segmentation model (.onnx)",
+    )
+
     return parser.parse_args()
 
 
