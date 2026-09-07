@@ -93,3 +93,32 @@ class NailRenderer:
 
         composited = (final_nail_layer * effective_alpha) + (base_float * (1.0 - effective_alpha))
         return np.clip(composited, 0, 255).astype(np.uint8)
+
+    def apply_solid_color(
+        self,
+        image_bgr: np.ndarray,
+        mask: np.ndarray,
+        color_bgr: Optional[Tuple[int, int, int]] = None,
+        finish: str = "glossy",
+        hex_color: Optional[str] = None,
+    ) -> np.ndarray:
+        """
+        Legacy compatibility method for rendering nail polish color.
+
+        Args:
+            image_bgr: Original input image in uint8 BGR.
+            mask: Binary nail mask in uint8.
+            color_bgr: Optional BGR tuple.
+            finish: Polish finish preset.
+            hex_color: Optional hex string.
+
+        Returns:
+            Rendered composite image.
+        """
+        if hex_color is None and color_bgr is not None:
+            b, g, r = color_bgr
+            hex_color = f"#{r:02x}{g:02x}{b:02x}"
+        elif hex_color is None:
+            hex_color = "#B22222"
+
+        return self.render(image_bgr=image_bgr, mask=mask, hex_color=hex_color, finish=finish)
