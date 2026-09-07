@@ -1,5 +1,5 @@
 """Photorealistic nail color rendering with luminance preservation and specular highlights."""
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any
 import cv2
 import numpy as np
 
@@ -39,7 +39,7 @@ class NailRenderer:
         self,
         image_bgr: np.ndarray,
         mask: np.ndarray,
-        hex_color: str,
+        hex_color: str = "#B22222",
         finish: str = "glossy",
     ) -> np.ndarray:
         """
@@ -58,8 +58,16 @@ class NailRenderer:
             return image_bgr.copy()
 
         preset = self.FINISH_PRESETS.get(finish.lower(), self.FINISH_PRESETS["glossy"])
-        feather_size = self.default_feather_radius if self.default_feather_radius is not None else preset["feather_radius"]
-        opacity = self.default_opacity if self.default_opacity is not None else preset["opacity"]
+        feather_size = (
+            self.default_feather_radius
+            if self.default_feather_radius is not None
+            else preset["feather_radius"]
+        )
+        opacity = (
+            self.default_opacity
+            if self.default_opacity is not None
+            else preset["opacity"]
+        )
         target_bgr = self.hex_to_bgr(hex_color)
 
         # 1. Soften mask boundaries (Anti-Aliasing / Feathering)
@@ -96,29 +104,56 @@ class NailRenderer:
 
     def apply_solid_color(
         self,
-        image_bgr: np.ndarray,
-        mask: np.ndarray,
+        *args: Any,
+        base_image: Optional[np.ndarray] = None,
+        image_bgr: Optional[np.ndarray] = None,
+        image: Optional[np.ndarray] = None,
+        mask: Optional[np.ndarray] = None,
         color_bgr: Optional[Tuple[int, int, int]] = None,
-        finish: str = "glossy",
+        color: Optional[Tuple[int, int, int]] = None,
         hex_color: Optional[str] = None,
+        finish: str = "glossy",
+        **kwargs: Any,
     ) -> np.ndarray:
         """
-        Legacy compatibility method for rendering nail polish color.
-
-        Args:
-            image_bgr: Original input image in uint8 BGR.
-            mask: Binary nail mask in uint8.
-            color_bgr: Optional BGR tuple.
-            finish: Polish finish preset.
-            hex_color: Optional hex string.
-
-        Returns:
-            Rendered composite image.
+        Legacy compatibility wrapper that handles various positional and keyword argument variations.
         """
-        if hex_color is None and color_bgr is not None:
-            b, g, r = color_bgr
-            hex_color = f"#{r:02x}{g:02x}{b:02x}"
-        elif hex_color is None:
-            hex_color = "#B22222"
+        # Resolve target base image
+        target_image = base_image if base_image is not None else (image_bgr if image_bgr is not None else image)
+        if target_image is None and len(args) > 0:
+            target_image = args[0]
 
-        return self.render(image_bgr=image_bgr, mask=mask, hex_color=hex_color, finish=finish)
+        # Resolve target mask
+        target_mask = mask
+        if target_mask is None and len(args) > 1:
+            target_mask = args[1]
+
+        # Resolve color inputs
+        target_color_bgr = color_bgr if color_bgr is not None else color
+        if target_color_bgr is None and len(args) > 2 and isinstance(args[2], (tuple, list)):
+            target_color_bgr = tuple(args[2])
+
+        target_hex = hex_color
+        if target_hex is None and len(args) > 2 and isinstance(args[2], str):
+            target_hex = args[2]
+
+        if target_hex is None and target_color_bgr is not None:
+            b, g, r = target_color_bgr
+            target_hex = f"#{r:02x}{g:02x}{b:02x}"
+        elif target_hex is None:
+            target_hex = "#B22222"
+
+        # Resolve finish preset
+        target_finish = finish
+        if "finish" not in kwargs and len(args) > 3 and isinstance(args[3], str):
+            target_finish = args[3]
+
+        if target_image is None:
+            raise ValueError("No input image was provided to apply_solid_color.")
+
+        return self.render(
+            image_bgr=target_image,
+            mask=target_mask,
+            hex_color=target_hex,
+            finish=target_finish,
+        )
