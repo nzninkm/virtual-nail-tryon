@@ -1,91 +1,84 @@
-"""Photorealistic nail rendering engine with shadow preservation and specular highlight synthesis."""
+"""Photorealistic nail color rendering with luminance preservation and specular highlights."""
+from typing import Tuple
 import cv2
 import numpy as np
-from typing import Tuple
 
 
 class NailRenderer:
-    """Renders solid colors and textures onto nail plates while preserving natural lighting dynamics."""
+    """Renders realistic nail polish with multiple finish types (glossy, matte, metallic)."""
 
-    def __init__(self, feather_radius: int = 5):
-        self.feather_radius = feather_radius
+    FINISH_PRESETS = {
+        "glossy": {"highlight_boost": 1.4, "feather_radius": 5, "opacity": 0.88},
+        "matte": {"highlight_boost": 0.3, "feather_radius": 3, "opacity": 0.92},
+        "metallic": {"highlight_boost": 1.9, "feather_radius": 5, "opacity": 0.85},
+    }
 
-    def apply_solid_color(
+    @staticmethod
+    def hex_to_bgr(hex_color: str) -> Tuple[int, int, int]:
+        """Convert a hex color string (e.g. #B22222 or B22222) to BGR tuple."""
+        cleaned_hex = hex_color.lstrip("#")
+        if len(cleaned_hex) != 6:
+            raise ValueError(f"Invalid hex color format: {hex_color}")
+        r = int(cleaned_hex[0:2], 16)
+        g = int(cleaned_hex[2:4], 16)
+        b = int(cleaned_hex[4:6], 16)
+        return (b, g, r)
+
+    def render(
         self,
-        base_image: np.ndarray,
-        nail_mask: np.ndarray,
-        color_bgr: Tuple[int, int, int],
+        image_bgr: np.ndarray,
+        mask: np.ndarray,
+        hex_color: str,
         finish: str = "glossy",
-        blend_strength: float = 0.85,
     ) -> np.ndarray:
         """
-        Apply realistic polish color onto the nail area using LAB luminance modulation and specular extraction.
+        Apply photorealistic nail polish to the target mask area.
 
-        :param base_image: Original full BGR image.
-        :param nail_mask: Binary or grayscale single-channel nail mask.
-        :param color_bgr: Desired nail color in (B, G, R) format.
-        :param finish: Finish type ('glossy', 'matte', 'metallic').
-        :param blend_strength: Blending intensity (0.0 to 1.0).
-        :return: Output BGR image with realistic nail polish.
+        Args:
+            image_bgr: Original input image (H, W, 3) in uint8 BGR.
+            mask: Binary nail mask (H, W) in uint8 (0 or 255).
+            hex_color: Target nail polish color in hex string format.
+            finish: Finish style preset ('glossy', 'matte', 'metallic').
+
+        Returns:
+            Rendered composite image in uint8 BGR.
         """
-        if nail_mask is None or np.sum(nail_mask) == 0:
-            return base_image.copy()
+        if mask is None or np.count_nonzero(mask) == 0:
+            return image_bgr.copy()
 
-        output = base_image.copy()
-        h, w = base_image.shape[:2]
+        params = self.FINISH_PRESETS.get(finish.lower(), self.FINISH_PRESETS["glossy"])
+        target_bgr = self.hex_to_bgr(hex_color)
 
         # 1. Soften mask boundaries (Anti-Aliasing / Feathering)
-        ksize = self.feather_radius * 2 + 1
-        soft_mask = cv2.GaussianBlur(nail_mask.astype(np.float32) / 255.0, (ksize, ksize), 0)
-        soft_mask_3c = np.repeat(soft_mask[:, :, np.newaxis], 3, axis=2)
+        feather_size = params["feather_radius"]
+        if feather_size % 2 == 0:
+            feather_size += 1
+        soft_mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0).astype(np.float32) / 255.0
+        soft_mask_3ch = np.repeat(soft_mask[:, :, np.newaxis], 3, axis=2)
 
-        # 2. Extract Luminance and Lighting structure from original nail
-        lab_img = cv2.cvtColor(base_image, cv2.COLOR_BGR2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab_img)
+        # 2. Extract luminance channel from original image in LAB space
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        l_channel, _, _ = cv2.split(lab)
+        norm_l = (l_channel.astype(np.float32) / 255.0)[:, :, np.newaxis]
 
-        # Normalize luminance to serve as lighting multiplier [0.3 to 1.3]
-        l_norm = l_channel.astype(np.float32) / 255.0
-        shadow_map = np.clip(l_norm * 1.4, 0.2, 1.2)
-        shadow_map_3c = np.repeat(shadow_map[:, :, np.newaxis], 3, axis=2)
+        # 3. Create target solid color layer and blend with base luminance (Multiply shading)
+        color_layer = np.full_like(image_bgr, target_bgr, dtype=np.float32)
+        shaded_color = color_layer * (norm_l * 0.8 + 0.2)
 
-        # 3. Create target solid color canvas
-        color_canvas = np.full_like(base_image, color_bgr, dtype=np.uint8).astype(np.float32)
+        # 4. Extract specular reflection highlights
+        _, highlight_mask = cv2.threshold(l_channel, 180, 255, cv2.THRESH_BINARY)
+        highlight_soft = cv2.GaussianBlur(highlight_mask, (5, 5), 0).astype(np.float32) / 255.0
+        highlight_layer = (highlight_soft * params["highlight_boost"] * 255.0)[:, :, np.newaxis]
+        highlight_layer = np.clip(highlight_layer, 0.0, 255.0)
 
-        # 4. Modulate color canvas with original shadows (Preserve 3D depth)
-        shaded_color = color_canvas * shadow_map_3c
+        # 5. Composite metallic or glossy highlights using additive screen blending
+        final_nail_layer = shaded_color + (highlight_layer * 0.6)
+        final_nail_layer = np.clip(final_nail_layer, 0.0, 255.0)
 
-        # 5. Extract and amplify Specular Highlights (Environmental reflections)
-        # Isolate brightest pixels within nail region
-        gray_img = cv2.cvtColor(base_image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced_gray = clahe.apply(gray_img)
+        # 6. Alpha composite rendered nails onto the original image
+        base_float = image_bgr.astype(np.float32)
+        opacity = params["opacity"]
+        effective_alpha = soft_mask_3ch * opacity
 
-        # Extract top 15% brightest highlights
-        _, highlight_thresh = cv2.threshold(enhanced_gray, 200, 255, cv2.THRESH_BINARY)
-        highlight_mask = cv2.GaussianBlur(highlight_thresh.astype(np.float32) / 255.0, (7, 7), 0)
-        highlight_mask = highlight_mask * soft_mask  # Constrain strictly to nail plate
-
-        highlight_3c = np.repeat(highlight_mask[:, :, np.newaxis], 3, axis=2)
-
-        # Apply finish characteristics
-        if finish == "glossy":
-            specular_boost = highlight_3c * 180.0
-            composite = (shaded_color * blend_strength) + (base_image.astype(np.float32) * (1.0 - blend_strength))
-            composite = np.clip(composite + specular_boost, 0, 255)
-        elif finish == "metallic":
-            metallic_sheen = (1.0 - np.abs(l_norm - 0.6)) * 40.0
-            metallic_sheen_3c = np.repeat(metallic_sheen[:, :, np.newaxis], 3, axis=2)
-            specular_boost = highlight_3c * 220.0
-            composite = (shaded_color * blend_strength) + metallic_sheen_3c + specular_boost
-            composite = np.clip(composite, 0, 255)
-        elif finish == "matte":
-            # Flatten highlights for a smooth diffused matte texture
-            diffused_shade = cv2.GaussianBlur(shaded_color, (9, 9), 0)
-            composite = (diffused_shade * blend_strength) + (base_image.astype(np.float32) * (1.0 - blend_strength))
-            composite = np.clip(composite, 0, 255)
-        else:
-            composite = shaded_color
-
-        # 6. Final Alpha Blending with anti-aliased edge transition
-        final_result = (composite * soft_mask_3c) + (base_image.astype(np.float32) * (1.0 - soft_mask_3c))
-        return np.clip(final_result, 0, 255).astype(np.uint8)
+        composited = (final_nail_layer * effective_alpha) + (base_float * (1.0 - effective_alpha))
+        return np.clip(composited, 0, 255).astype(np.uint8)
