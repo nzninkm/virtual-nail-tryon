@@ -1,17 +1,16 @@
-"""Virtual Nail Try-On CLI application for real-time nail color and art augmentation."""
+"""Virtual Nail Try-On CLI application powered by YOLOv8 nail segmentation."""
 import os
 import argparse
 import cv2
 import numpy as np
 from typing import Tuple
 
-from src.pipeline.hand_detector import HandDetector
-from src.pipeline.segmenter import NailSegmenter
+from src.pipeline.ai_segmenter import YOLONailSegmenter
 from src.pipeline.renderer import NailRenderer
 
 
 def hex_to_bgr(hex_str: str) -> Tuple[int, int, int]:
-    """Convert HEX color code (e.g. #D22B2B or #B22222) to BGR tuple."""
+    """Convert HEX color code (e.g. #B22222 or #FF1493) to BGR tuple."""
     hex_clean = hex_str.lstrip("#")
     if len(hex_clean) != 6:
         raise ValueError(f"Invalid hex color format: {hex_str}")
@@ -21,18 +20,20 @@ def hex_to_bgr(hex_str: str) -> Tuple[int, int, int]:
 
 def parse_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Virtual Nail Color & Art Try-On Pipeline")
+    parser = argparse.ArgumentParser(description="Virtual Nail Color Try-On Pipeline via YOLOv8")
     parser.add_argument("--image", type=str, required=True, help="Path to input hand image")
     parser.add_argument("--hex", type=str, default="#B22222", help="Hex color code (e.g. #B22222, #FF1493)")
     parser.add_argument("--finish", type=str, default="glossy", choices=["glossy", "matte", "metallic"], help="Polish finish style")
-    parser.add_argument("--ai-model", type=str, default=None, help="Optional ONNX nail segmentation model path")
+    parser.add_argument("--model", type=str, default="mnemic/nails_seg_yolov8", help="YOLOv8-seg model identifier or weights path")
+    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold for nail detection")
     parser.add_argument("--output", type=str, default="output.jpg", help="Path to save output result")
+    parser.add_argument("--save-mask", type=str, default=None, help="Optional path to save binary nail mask")
     parser.add_argument("--side-by-side", action="store_true", help="Save side-by-side before/after comparison")
     return parser.parse_args()
 
 
 def main():
-    """Run try-on pipeline with robust multi-finger detection and realistic lighting blend."""
+    """Run try-on pipeline with YOLO nail segmentation and photorealistic shader blend."""
     args = parse_args()
 
     if not os.path.exists(args.image):
@@ -48,35 +49,22 @@ def main():
     selected_bgr = hex_to_bgr(args.hex)
     print(f"[INFO] Selected Color (BGR): {selected_bgr} | Finish: {args.finish}")
 
-    # Initialize components
-    hand_detector = HandDetector()
-    segmenter = NailSegmenter(ai_model_path=args.ai_model)
-    renderer = NailRenderer(feather_radius=4)
+    # 1. Initialize segmenter and renderer
+    segmenter = YOLONailSegmenter(model_path=args.model, conf_threshold=args.conf)
+    renderer = NailRenderer(feather_radius=3)
 
-    # 1. Detect hands and landmarks
-    landmarks = hand_detector.detect(orig_bgr)
-    if not landmarks:
-        print("[WARNING] No hand detected in the image.")
+    # 2. Extract nail masks
+    accumulated_mask, individual_masks = segmenter.segment_nails(orig_bgr)
+    print(f"[INFO] Successfully segmented {len(individual_masks)} nails.")
+
+    if len(individual_masks) == 0:
+        print("[WARNING] Could not detect any nails to colorize.")
         return
 
-    # 2. Extract fingertips and accumulate masks
-    h, w = orig_bgr.shape[:2]
-    accumulated_mask = np.zeros((h, w), dtype=np.uint8)
-
-    fingertip_rois = hand_detector.get_fingertip_rois(orig_bgr, landmarks)
-    print(f"[INFO] Detected {len(fingertip_rois)} fingertip regions.")
-
-    for roi_data in fingertip_rois:
-        roi = roi_data["roi"]
-        x, y, rw, rh = roi_data["bbox"]
-        tip_local = roi_data["tip_local"]
-        dip_local = roi_data["dip_local"]
-
-        mask_local = segmenter.segment_nail(roi, tip_local, dip_local)
-        accumulated_mask[y:y + rh, x:x + rw] = cv2.bitwise_or(
-            accumulated_mask[y:y + rh, x:x + rw],
-            mask_local
-        )
+    # Optionally save debug mask
+    if args.save_mask:
+        cv2.imwrite(args.save_mask, accumulated_mask)
+        print(f"[INFO] Binary nail mask saved to: {args.save_mask}")
 
     # 3. Realistic Polish Rendering
     result_bgr = renderer.apply_solid_color(
@@ -89,13 +77,14 @@ def main():
 
     # 4. Save result (Side-by-Side or single)
     if args.side_by_side:
+        h = orig_bgr.shape[0]
         separator = np.full((h, 8, 3), (255, 255, 255), dtype=np.uint8)
         final_output = np.hstack([orig_bgr, separator, result_bgr])
     else:
         final_output = result_bgr
 
     cv2.imwrite(args.output, final_output)
-    print(f"[SUCCESS] Render completed successfully! Saved to: {args.output}")
+    print(f"[SUCCESS] Pipeline completed successfully! Saved to: {args.output}")
 
 
 if __name__ == "__main__":
