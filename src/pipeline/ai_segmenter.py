@@ -12,14 +12,16 @@ class YOLONailSegmenter:
     """Performs precise nail segmentation using a pre-trained YOLOv8 segmentation network."""
 
     MODEL_FILENAME = "nails_seg_s_yolov8_v1.pt"
-    MODEL_DOWNLOAD_URL = (
-        "https://huggingface.co/mnemic/nails_seg_yolov8/resolve/main/nails_seg_s_yolov8_v1.pt"
-    )
+    # Using primary and mirror URLs to ensure reliable downloading
+    DOWNLOAD_URLS = [
+        "https://hf-mirror.com/mnemic/nails_seg_yolov8/resolve/main/nails_seg_s_yolov8_v1.pt",
+        "https://huggingface.co/mnemic/nails_seg_yolov8/resolve/main/nails_seg_s_yolov8_v1.pt",
+    ]
 
     def __init__(self, model_path: Optional[str] = None, conf_threshold: float = 0.25):
         """
         Initialize the YOLO nail segmenter.
-        Automatically downloads weights if not present locally.
+        Automatically checks local models directory and downloads if missing.
         """
         resolved_weights_path = self._resolve_model_path(model_path)
         print(f"[INFO] Loading YOLO nail segmentation weights: {resolved_weights_path}")
@@ -31,21 +33,36 @@ class YOLONailSegmenter:
         if model_path and os.path.exists(model_path):
             return model_path
 
-        # Determine project root and models directory
         project_root = Path(__file__).resolve().parents[2]
         models_dir = project_root / "models"
         models_dir.mkdir(parents=True, exist_ok=True)
         local_weights = models_dir / self.MODEL_FILENAME
 
-        if not local_weights.exists():
-            print(f"[INFO] Model weights not found locally. Downloading from {self.MODEL_DOWNLOAD_URL} ...")
+        if local_weights.exists() and local_weights.stat().st_size > 1000:
+            return str(local_weights)
+
+        print(f"[INFO] Model weights not found in '{models_dir}'. Attempting auto-download...")
+        downloaded = False
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+        for url in self.DOWNLOAD_URLS:
             try:
-                urllib.request.urlretrieve(self.MODEL_DOWNLOAD_URL, str(local_weights))
-                print(f"[INFO] Download completed and saved to: {local_weights}")
+                print(f"[INFO] Fetching weights from: {url}")
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=40) as response, open(local_weights, "wb") as out_file:
+                    out_file.write(response.read())
+                downloaded = True
+                print(f"[SUCCESS] Weights successfully downloaded and saved to: {local_weights}")
+                break
             except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to download YOLO nail weights from Hugging Face: {exc}"
-                ) from exc
+                print(f"[WARNING] Download attempt failed for {url}: {exc}")
+
+        if not downloaded:
+            raise RuntimeError(
+                f"Could not download '{self.MODEL_FILENAME}'. "
+                f"Please manually download the file from https://huggingface.co/mnemic/nails_seg_yolov8/resolve/main/nails_seg_s_yolov8_v1.pt "
+                f"and place it inside '{models_dir}'."
+            )
 
         return str(local_weights)
 
@@ -64,25 +81,21 @@ class YOLONailSegmenter:
         accumulated_mask = np.zeros((h, w), dtype=np.uint8)
         individual_masks: List[np.ndarray] = []
 
-        # Run model inference
         results = self.model(image_bgr, conf=self.conf_threshold, verbose=False)
 
         if not results or results[0].masks is None:
             print("[WARNING] No nails detected by YOLO segmentation model.")
             return accumulated_mask, individual_masks
 
-        # Extract predicted segmentation masks
         masks_tensor = results[0].masks.data
 
         for mask_t in masks_tensor:
             mask_np = (mask_t.cpu().numpy() * 255).astype(np.uint8)
 
-            # Resize to original input image dimensions if necessary
             if mask_np.shape[:2] != (h, w):
                 mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_LINEAR)
                 _, mask_np = cv2.threshold(mask_np, 127, 255, cv2.THRESH_BINARY)
 
-            # Smooth mask boundaries using morphological closing
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
 
