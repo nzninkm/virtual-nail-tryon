@@ -1,16 +1,16 @@
-"""Photorealistic nail color rendering with luminance preservation and specular highlights."""
+"""Photorealistic nail color rendering with accurate hue mapping and specular preservation."""
 from typing import Tuple, Optional, Any
 import cv2
 import numpy as np
 
 
 class NailRenderer:
-    """Renders realistic nail polish with multiple finish types (glossy, matte, metallic)."""
+    """Renders realistic nail polish with accurate color transfer and specular highlights."""
 
     FINISH_PRESETS = {
-        "glossy": {"highlight_boost": 1.4, "feather_radius": 5, "opacity": 0.88},
-        "matte": {"highlight_boost": 0.3, "feather_radius": 3, "opacity": 0.92},
-        "metallic": {"highlight_boost": 1.9, "feather_radius": 5, "opacity": 0.85},
+        "glossy": {"highlight_boost": 1.5, "feather_radius": 5, "opacity": 0.95},
+        "matte": {"highlight_boost": 0.2, "feather_radius": 3, "opacity": 0.98},
+        "metallic": {"highlight_boost": 2.2, "feather_radius": 5, "opacity": 0.92},
     }
 
     def __init__(self, feather_radius: Optional[int] = None, default_opacity: Optional[float] = None):
@@ -26,7 +26,7 @@ class NailRenderer:
 
     @staticmethod
     def hex_to_bgr(hex_color: str) -> Tuple[int, int, int]:
-        """Convert a hex color string (e.g. #B22222 or B22222) to BGR tuple."""
+        """Convert a hex color string (e.g. #800020) to BGR tuple."""
         cleaned_hex = hex_color.lstrip("#")
         if len(cleaned_hex) != 6:
             raise ValueError(f"Invalid hex color format: {hex_color}")
@@ -39,11 +39,11 @@ class NailRenderer:
         self,
         image_bgr: np.ndarray,
         mask: np.ndarray,
-        hex_color: str = "#B22222",
+        hex_color: str = "#800020",
         finish: str = "glossy",
     ) -> np.ndarray:
         """
-        Apply photorealistic nail polish to the target mask area.
+        Apply photorealistic nail polish to the target mask area using LAB color synthesis.
 
         Args:
             image_bgr: Original input image (H, W, 3) in uint8 BGR.
@@ -70,36 +70,49 @@ class NailRenderer:
         )
         target_bgr = self.hex_to_bgr(hex_color)
 
-        # 1. Soften mask boundaries (Anti-Aliasing / Feathering)
+        # 1. Soft feathering for natural cuticle edges
         if feather_size % 2 == 0:
             feather_size += 1
         soft_mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0).astype(np.float32) / 255.0
         soft_mask_3ch = np.repeat(soft_mask[:, :, np.newaxis], 3, axis=2)
 
-        # 2. Extract luminance channel from original image in LAB space
-        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-        l_channel, _, _ = cv2.split(lab)
-        norm_l = (l_channel.astype(np.float32) / 255.0)[:, :, np.newaxis]
+        # 2. Convert base image to LAB
+        base_lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        base_l, _, _ = cv2.split(base_lab)
 
-        # 3. Create target solid color layer and blend with base luminance (Multiply shading)
-        color_layer = np.full_like(image_bgr, target_bgr, dtype=np.float32)
-        shaded_color = color_layer * (norm_l * 0.8 + 0.2)
+        # 3. Create target color in LAB
+        target_patch = np.full((1, 1, 3), target_bgr, dtype=np.uint8)
+        target_lab = cv2.cvtColor(target_patch, cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
+        t_l, t_a, t_b = target_lab[0], target_lab[1], target_lab[2]
 
-        # 4. Extract specular reflection highlights
-        _, highlight_mask = cv2.threshold(l_channel, 180, 255, cv2.THRESH_BINARY)
-        highlight_soft = cv2.GaussianBlur(highlight_mask, (5, 5), 0).astype(np.float32) / 255.0
-        highlight_layer = (highlight_soft * preset["highlight_boost"] * 255.0)[:, :, np.newaxis]
-        highlight_layer = np.clip(highlight_layer, 0.0, 255.0)
+        # 4. Synthesize new nail layer: retain luminance curve while locking target chrominance
+        # Adjust base L toward target color's base luminance
+        mean_mask_l = np.mean(base_l[mask > 0]) if np.count_nonzero(mask) > 0 else 128.0
+        normalized_l_delta = (base_l - mean_mask_l) * 0.45
+        new_l = np.clip(t_l + normalized_l_delta, 10.0, 250.0)
 
-        # 5. Composite metallic or glossy highlights using additive screen blending
-        final_nail_layer = shaded_color + (highlight_layer * 0.6)
-        final_nail_layer = np.clip(final_nail_layer, 0.0, 255.0)
+        # Fill Chrominance (A and B channels) with exact target hue
+        new_a = np.full_like(base_l, t_a)
+        new_b = np.full_like(base_l, t_b)
 
-        # 6. Alpha composite rendered nails onto the original image
-        base_float = image_bgr.astype(np.float32)
+        reconstructed_lab = cv2.merge([new_l, new_a, new_b]).astype(np.uint8)
+        polished_bgr = cv2.cvtColor(reconstructed_lab, cv2.COLOR_LAB2BGR).astype(np.float32)
+
+        # 5. Extract natural specular highlights from original image
+        _, raw_highlights = cv2.threshold(base_l.astype(np.uint8), 195, 255, cv2.THRESH_BINARY)
+        soft_highlights = cv2.GaussianBlur(raw_highlights, (5, 5), 0).astype(np.float32) / 255.0
+        highlights_3ch = np.repeat(soft_highlights[:, :, np.newaxis], 3, axis=2)
+
+        # 6. Apply highlights based on finish
+        boost = preset["highlight_boost"]
+        polished_bgr = polished_bgr + (highlights_3ch * boost * 40.0)
+        polished_bgr = np.clip(polished_bgr, 0.0, 255.0)
+
+        # 7. Alpha composite
+        base_bgr_float = image_bgr.astype(np.float32)
         effective_alpha = soft_mask_3ch * opacity
+        composited = (polished_bgr * effective_alpha) + (base_bgr_float * (1.0 - effective_alpha))
 
-        composited = (final_nail_layer * effective_alpha) + (base_float * (1.0 - effective_alpha))
         return np.clip(composited, 0, 255).astype(np.uint8)
 
     def apply_solid_color(
@@ -118,17 +131,14 @@ class NailRenderer:
         """
         Legacy compatibility wrapper that handles various positional and keyword argument variations.
         """
-        # Resolve target base image
         target_image = base_image if base_image is not None else (image_bgr if image_bgr is not None else image)
         if target_image is None and len(args) > 0:
             target_image = args[0]
 
-        # Resolve target mask
         target_mask = mask
         if target_mask is None and len(args) > 1:
             target_mask = args[1]
 
-        # Resolve color inputs
         target_color_bgr = color_bgr if color_bgr is not None else color
         if target_color_bgr is None and len(args) > 2 and isinstance(args[2], (tuple, list)):
             target_color_bgr = tuple(args[2])
@@ -141,9 +151,8 @@ class NailRenderer:
             b, g, r = target_color_bgr
             target_hex = f"#{r:02x}{g:02x}{b:02x}"
         elif target_hex is None:
-            target_hex = "#B22222"
+            target_hex = "#800020"
 
-        # Resolve finish preset
         target_finish = finish
         if "finish" not in kwargs and len(args) > 3 and isinstance(args[3], str):
             target_finish = args[3]
