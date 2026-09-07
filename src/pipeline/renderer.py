@@ -1,5 +1,5 @@
 """Photorealistic nail color rendering with luminance preservation and specular highlights."""
-from typing import Tuple
+from typing import Tuple, Optional
 import cv2
 import numpy as np
 
@@ -12,6 +12,17 @@ class NailRenderer:
         "matte": {"highlight_boost": 0.3, "feather_radius": 3, "opacity": 0.92},
         "metallic": {"highlight_boost": 1.9, "feather_radius": 5, "opacity": 0.85},
     }
+
+    def __init__(self, feather_radius: Optional[int] = None, default_opacity: Optional[float] = None):
+        """
+        Initialize the nail renderer with optional override defaults.
+
+        Args:
+            feather_radius: Optional default blur radius for mask feathering.
+            default_opacity: Optional base alpha opacity for polish blending.
+        """
+        self.default_feather_radius = feather_radius
+        self.default_opacity = default_opacity
 
     @staticmethod
     def hex_to_bgr(hex_color: str) -> Tuple[int, int, int]:
@@ -46,11 +57,12 @@ class NailRenderer:
         if mask is None or np.count_nonzero(mask) == 0:
             return image_bgr.copy()
 
-        params = self.FINISH_PRESETS.get(finish.lower(), self.FINISH_PRESETS["glossy"])
+        preset = self.FINISH_PRESETS.get(finish.lower(), self.FINISH_PRESETS["glossy"])
+        feather_size = self.default_feather_radius if self.default_feather_radius is not None else preset["feather_radius"]
+        opacity = self.default_opacity if self.default_opacity is not None else preset["opacity"]
         target_bgr = self.hex_to_bgr(hex_color)
 
         # 1. Soften mask boundaries (Anti-Aliasing / Feathering)
-        feather_size = params["feather_radius"]
         if feather_size % 2 == 0:
             feather_size += 1
         soft_mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0).astype(np.float32) / 255.0
@@ -68,7 +80,7 @@ class NailRenderer:
         # 4. Extract specular reflection highlights
         _, highlight_mask = cv2.threshold(l_channel, 180, 255, cv2.THRESH_BINARY)
         highlight_soft = cv2.GaussianBlur(highlight_mask, (5, 5), 0).astype(np.float32) / 255.0
-        highlight_layer = (highlight_soft * params["highlight_boost"] * 255.0)[:, :, np.newaxis]
+        highlight_layer = (highlight_soft * preset["highlight_boost"] * 255.0)[:, :, np.newaxis]
         highlight_layer = np.clip(highlight_layer, 0.0, 255.0)
 
         # 5. Composite metallic or glossy highlights using additive screen blending
@@ -77,7 +89,6 @@ class NailRenderer:
 
         # 6. Alpha composite rendered nails onto the original image
         base_float = image_bgr.astype(np.float32)
-        opacity = params["opacity"]
         effective_alpha = soft_mask_3ch * opacity
 
         composited = (final_nail_layer * effective_alpha) + (base_float * (1.0 - effective_alpha))
